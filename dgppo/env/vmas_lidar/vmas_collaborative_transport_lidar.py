@@ -79,6 +79,8 @@ class VMASCollaborativeTransportLidarState(NamedTuple):
 LidarEnvGraphsTuple = GraphsTuple[State, VMASCollaborativeTransportLidarState]
 
 class VMASCollaborativeTransportLidar(MultiAgentEnv):
+    # Preserve the existing World interval independently of the declared env.dt.
+    physics_dt = 0.1
     AGENT = 0
     GOAL = 1
     OBS = 2
@@ -600,6 +602,7 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
 
 
         world = World(
+            dt=self.physics_dt,
             x_semidim=self.area_size,
             y_semidim=self.area_size,
             contact_margin=6e-3,

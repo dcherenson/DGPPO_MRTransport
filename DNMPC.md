@@ -8,22 +8,23 @@ the robot/load model and attachment constraint follow the requested planar
 adaptation. It does not reproduce the 3D Fly-Crane experiments.
 
 The existing spring-coupled plant, rewards, all four safety costs, LiDAR, wind,
-policy and training code are preserved. Initial validation shows goal tracking
-and obstacle avoidance, but also collisions, nonmonotone consensus residuals
-and benchmark QP failures. These are small implementation checks, not estimates
-of comparative controller performance.
+policy and training code are preserved. The current diagnostic uses complete
+communication and predictions matched to the actual 0.1 s physical interval.
+Full SQP with at most ten iterations is the feasibility gate before any RTI
+budget sweep or larger nominal evaluation. Historical initial results are
+retained below; they are not results of the corrected implementation.
 
 ## Files and dependencies
 
 | File | Purpose |
 | --- | --- |
 | `dgppo/controllers/__init__.py` | Controller package |
-| `dgppo/controllers/dnmpc.py` | Reference, fixed sparse graph, Jacobi ADMM, warm starts and actions |
+| `dgppo/controllers/dnmpc.py` | Reference, complete graph, Jacobi ADMM, warm starts, actions and per-solve feasibility diagnostics |
 | `dgppo/controllers/dnmpc_acados.py` | One local ACADOS OCP and the small configuration block |
 | `test_dnmpc.py` | Python evaluation loop, original metrics, Rollout, plots and native videos |
 | `DNMPC.md` | Formulation, reproduction commands and validation results |
 | `README.md` | Link to this note |
-| `dgppo/env/vmas_lidar/vmas_collaborative_transport_lidar.py` | Tiny renderer node-count correction: graphs contain agents, LiDAR hits and a padding node; goal/payload are in `env_states` |
+| `dgppo/env/vmas_lidar/vmas_collaborative_transport_lidar.py` | Explicit `physics_dt=0.1` passed to World; retains the earlier renderer node-count correction |
 
 ACADOS is installed outside the repository at
 `/Users/dmrc/.local/share/acados/v0.6.0`, native ARM64, commit
@@ -49,11 +50,15 @@ The controller reads exact robot position/velocity and payload pose from
 acceleration directly through `env.step`. Actions have shape `(env.num_agents,2)`;
 inactive entries are zero. There is no added inner controller.
 
-The declared `env.dt` is **0.03 s**, so **H=50** and the prediction horizon is
-**1.5 s**. The unchanged plant constructs `World` without a `dt` argument and
-therefore advances **0.1 s**, with five 0.02 s substeps, per call. The user
-explicitly selected prediction with declared `env.dt`; this mismatch is printed
-and stored in metadata. Warm starts still shift one prediction stage as requested.
+The declared `env.dt` remains **0.03 s** for existing repository consumers.
+The environment now explicitly declares **`physics_dt=0.1`** and constructs
+`World(dt=self.physics_dt, substeps=5, ...)`. This is exactly the prior World's
+default: the plant still advances **0.1 s**, with five **0.02 s** substeps, per
+call. NMPC reads `env.physics_dt`: **dt=0.1 s, H=15, T=1.5 s**. State guesses,
+reference finite differences and ACADOS discretization all use that interval.
+Warm starts shift one 0.1 s stage per physical update. Startup and metadata show
+both declared and physical intervals. The earlier choice to use declared
+`env.dt` has been superseded by the present debugging request.
 
 The plant's polygon circumradius is
 `R_N = polygon_length/(2*sin(pi/N))`, where `polygon_length=0.2 m`. It is
@@ -92,12 +97,18 @@ dot(p_i)=v_i; dot(v_i)=a_i; dot(p_Li)=v_Li; dot(theta_Li)=omega_Li
 ```
 
 The spring forces and full payload dynamics remain in the simulation only.
-The local prediction uses multiple shooting with ERK, `SQP_RTI`,
-`PARTIAL_CONDENSING_HPIPM` and a Gauss-Newton Hessian. H=50 gives 357 state and
-250 control entries per local shooting trajectory; this does not grow with N.
+The local prediction uses multiple shooting with ERK,
+`PARTIAL_CONDENSING_HPIPM` and a Gauss-Newton Hessian. The option
+`--acados-nlp-solver {sqp_rti,sqp}` selects one RTI call (default) or full SQP
+with `nlp_solver_max_iter=10`; the optimization problem and solver tolerances
+are identical. H=15 gives 112 state and 75 control entries per local shooting
+trajectory; these decision dimensions do not grow with N.
 With three obstacles, both modes have 13 stage-cost residuals. Paper mode has
-21 stage parameters and 5 path/initial nonlinear constraints; benchmark has
-28 parameters and 10 constraints. Terminal constraints number 4 and 9 respectively.
+21 stage parameters, 5 path/initial nonlinear constraints and 4 terminal ones.
+Benchmark has `22+3*(N-1)` parameters, `8+(N-1)` path/initial nonlinear
+constraints and `7+(N-1)` terminal ones. Thus its constraint and parameter
+counts grow with complete communication, while the local state/input dimensions
+remain 7/5.
 Acceleration component bounds are separate from these nonlinear counts.
 
 At each stage, with wrapped yaw error `e_theta=atan2(sin(theta-ref),cos(theta-ref))`
@@ -141,17 +152,18 @@ There is no invented hard velocity limit. The vertex inequality replaces the
 paper's exact Fly-Crane geometry and cable-angle constraints.
 
 Benchmark mode additionally encodes `||p_Li-c_obs|| >= R_N+obstacle_radius`
-and `||p_i-p_j_old|| >= 2*agent_radius` for graph neighbors only. The former
+and `||p_i-p_j_old|| >= 2*agent_radius` for every other active robot. The former
 uses a conservative payload circle. The latter uses robot trajectories frozen
 at the previous ADMM round; their exchange is a benchmark augmentation.
 Paper mode exchanges only load-input trajectories. The original environment
 still evaluates exact polygon/LiDAR costs and collisions against every active
-robot, including non-neighbors. These optimizer constraints are not a safety
-certificate for the mismatched plant or a partially converged RTI iterate.
+robot. These optimizer constraints are not a safety certificate for the
+spring-coupled plant or a partially converged solver iterate.
 
-N=3 uses edges (0,1),(1,2). N>=4 uses the fixed cycle with neighbors
-`(i-1)%N` and `(i+1)%N`. Degree is at most two and the graph never changes
-during a mission. Local decision and constraint dimensions stay constant as N grows.
+For every active robot i, `N_i={j in 0,...,N-1 : j != i}`. The undirected graph has
+`N*(N-1)/2` edges, every degree is N-1, and it is fixed during a mission.
+The observation/DGPPO distance graph is not used. Benchmark robot messages
+include all peers, with masked inactive slots for padded environments.
 
 ## Partition ADMM
 
@@ -175,6 +187,8 @@ before any primal solve. Every local solve uses those frozen messages. All
 new load inputs are collected before any dual update: this is Jacobi ADMM.
 The implementation uses only neighbor means, never an all-agent consensus average.
 Five rounds run per physical update; `--admm-iterations` changes that integer.
+The recorded residual is the maximum over every active pair and prediction
+stage, with separate Euclidean translational and absolute angular components.
 
 Initial load inputs equal the reference velocities and q=0; robot guesses use
 zero acceleration. At subsequent physical steps, states, controls and duals
@@ -184,7 +198,231 @@ The controller reintegrates and checks a previous feasible control sequence;
 if no feasible fallback is available it commands zero acceleration. Failed
 solver output is never used as a successful solution.
 
-## Validation results
+Every local solve records status, SQP iteration count, QP status/iterations,
+NLP residuals, and explicit inequality feasibility of the returned trajectory,
+including failed returned iterates before fallback. Checks use the exact frozen
+neighbor trajectories supplied to that local problem. Each family has its
+maximum positive violation and stage/obstacle/neighbor-slot location:
+acceleration components and norm (m/s²), robot-obstacle clearance, tether,
+benchmark payload-obstacle clearance and inter-agent clearance (m).
+The existing **1e-4** physical-unit feasibility tolerance is retained; no ACADOS
+tolerance is loosened. `predicted_feasible` never depends on status zero.
+Dynamics consistency is recorded separately in `dynamics_max_error`, alongside
+ACADOS equality residuals. Measured-state violations, the actual shifted warm
+guess, its reintegration, a rechecked cached trajectory, and a zero-input
+candidate provide diagnostic evidence about feasible starting trajectories.
+The zero-input candidate is only evaluated; it is not supplied to the solver.
+Final combined-trajectory feasibility flags use the newly collected robot
+trajectories and are distinct from each frozen local problem's result.
+
+Action acceptance and the existing failure recovery are preserved: a finite
+status-zero iterate supplies actions, explicit feasibility controls cache
+eligibility, and nonzero status uses the prior fallback. An unavailable feasible
+fallback latches zero acceleration for the entire physical update. Therefore
+feasibility is the reporting authority, not a new safety filter. Both all-fallback
+and zero-fallback update counts are recorded.
+
+## Full-SQP diagnostic after graph and timestep correction
+
+**The feasibility gate failed. Stop here: no RTI-pass sweep, ADMM-budget sweep,
+selected iteration budget or 20/50-mission nominal benchmark was run.** No
+weights, constraints, solver tolerances, reference logic, plant dynamics or wind
+were tuned to obtain these results. The multi-pass RTI option has consequently
+not been added. K=5 here is the diagnostic setting, not a validated selection.
+
+Each case is one 128-step mission (12.8 physical seconds), seed 1234, offset 0,
+three obstacles, wind=0, complete graph, dt=0.1, H=15, SQP max_iter=10. All
+15,360 local solves returned **ACADOS status 2 (maximum NLP iterations)** with
+`sqp_iter=10`. **14,060/15,360 (91.54%)** returned explicitly infeasible
+trajectories. Every completed QP reported status zero: these runs have **zero
+status-4 QP failures** and no HPIPM minimum-step events. This changes the failure
+type from the historical benchmark, without establishing a usable baseline.
+
+| Case | Local solves | Nonzero status | Explicitly infeasible | Max tether excess m | Fallback updates |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| N=3 paper | 1920 | 1920 (100%) | 1920 (100%) | 0.231615 | 128/128 |
+| N=3 benchmark | 1920 | 1920 (100%) | 1901 (99.01%) | 0.231616 | 128/128 |
+| N=4 paper | 2560 | 2560 (100%) | 2560 (100%) | 0.275969 | 128/128 |
+| N=4 benchmark | 2560 | 2560 (100%) | 1920 (75%) | 0.248301 | 128/128 |
+| N=5 paper | 3200 | 3200 (100%) | 3200 (100%) | 0.252746 | 128/128 |
+| N=5 benchmark | 3200 | 3200 (100%) | 2559 (79.97%) | 0.631252 | 128/128 |
+
+The only constraint family exceeding the unchanged 1e-4 tolerance is tether.
+Acceleration-component, acceleration-norm, robot-obstacle and benchmark
+payload-obstacle violation maxima are **0** in every case. Benchmark inter-agent
+maxima are 0 for N=3/4 and **1.87e-12 m** for N=5, below tolerance. Payload and
+inter-agent constraints are absent in paper mode. Tether excess means
+`||p_i-p_Li-R(theta_Li)r_i|| - 0.30`, so the largest returned tether distance
+is **0.931252 m**, not 0.631252 m.
+
+All physical updates required zero fallback for every robot. All executed
+accelerations were zero. Both constraint modes therefore produced identical
+plant trajectories within each N:
+
+| N (both modes) | Reward mean / std | Safe rate | Mission safe | Min goal distance m | Final position error m | Final absolute wrapped yaw error rad | Success @ .1/.2/.3/.5 m |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 3 | -23.40154 / 0 | 100% | 1 | 1.645453 | 1.645453 | 1.384955 | 0/0/0/0 |
+| 4 | -23.13341 / 0 | 100% | 1 | 1.610541 | 1.610541 | 1.384955 | 0/0/0/0 |
+| 5 | -22.83679 / 0 | 100% | 1 | 1.571919 | 1.571919 | 1.384955 | 0/0/0/0 |
+
+These are single-mission diagnostics, not nominal performance aggregates.
+For **all six cases**, the original four costs (inter-agent collision,
+robot-obstacle collision, payload-obstacle collision, tether/assigned-vertex
+deviation) have **0% unsafe active robot-steps**, **0% physical steps with any
+unsafe active robot**, **0% robots ever unsafe**, and no final-state violations.
+Safe rate increased because fallback held the system near its starting pose;
+it does not demonstrate safe transport.
+
+| Case | Mean / max local solve ms | Mean / max full update ms | Mean / max final ADMM residual |
+| --- | ---: | ---: | ---: |
+| N=3 paper | 2.166 / 4.377 | 46.315 / 83.827 | 0 / 0 |
+| N=3 benchmark | 2.944 / 12.831 | 62.816 / 102.406 | 0 / 0 |
+| N=4 paper | 2.240 / 10.087 | 63.926 / 126.479 | 0 / 0 |
+| N=4 benchmark | 3.198 / 13.180 | 88.168 / 165.384 | 0 / 0 |
+| N=5 paper | 2.365 / 23.583 | 83.744 / 161.010 | 0 / 0 |
+| N=5 benchmark | 4.328 / 91.267 | 150.901 / 288.263 | 0 / 0 |
+
+Timing excludes solver generation, environment compilation/stepping and plotting.
+The full-update time includes the added per-solve diagnostic checks and extraction.
+Translational and angular residuals are also identically zero at every recorded
+round, as are duals and consensus-center shifts. This is **fallback retaining
+identical reference load inputs**, not evidence of successful ADMM convergence.
+
+### Where and why the gate failed
+
+Steps, robot indices, ADMM rounds and horizon stages below are zero based.
+Every robot in every case first returns status 2 at **physical step 0, ADMM
+round 0**, and returns status 2 at **all steps 0–127 and all rounds 0–4**.
+The largest nonlinear violations are:
+
+| Case | Physical step (time s) | Robot | ADMM round | Horizon stage | Tether excess m |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| N=3 paper | 5 (0.5) | 1 | 1 | 15 | 0.231615 |
+| N=3 benchmark | 5 (0.5) | 1 | 1 | 15 | 0.231616 |
+| N=4 paper | 11 (1.1) | 1 | 0 | 15 | 0.275969 |
+| N=4 benchmark | 4 (0.4) | 1 | 0 | 15 | 0.248301 |
+| N=5 paper | 12 (1.2) | 2 | 0 | 15 | 0.252746 |
+| N=5 benchmark | 13 (1.3) | 0 | 1 | 15 | 0.631252 |
+
+All paper-mode robots violate tether at every solve (640 per robot). Benchmark
+N=3 counts by robot are **640/640/621**, N=4 **640/640/640/0**, and N=5
+**640/639/640/0/640**. The exact step/round/stage and magnitude of each of the
+14,060 violations are in `logs/dnmpc_sqp_diagnostic/constraint_failure_index.csv`.
+Full local records, including the feasible status-2 iterates, remain in each
+`episode_0000_diagnostics.json` and `episode_0000_diagnostic_failures.json`.
+
+The initial measured state passes every encoded constraint at every solve.
+Neither the actual shifted warm guess nor its reintegration is feasible, and
+no rechecked cached feasible sequence is available. At the very first solve,
+the reference-speed payload inputs combined with zero robot acceleration create
+a terminal warm-start tether excess of **1.224097/1.231416/1.240302 m** for
+N=3/4/5. The measured attachment itself has approximately **0.30 m remaining
+margin**. Benchmark initial peer clearance is approximately 0.02 m; the robot-0
+initial payload-obstacle clearance is 0.219041/0.198857/0.176692 m.
+
+A **zero-input prediction is explicitly feasible for every one of the 15,360
+frozen local problems**. It starts at the measured state and is integrated using
+the same local dynamics, satisfying both inequality and shooting constraints.
+It is only a diagnostic witness; the authorized work did not replace the
+existing initialization with it. Thus these results establish **failure of SQP
+to converge from the existing warm starts within ten iterations**, rather than
+mathematical infeasibility of these sampled OCPs. No alternative initialization
+experiment was run, so it is not established as the sole cause.
+
+Failure precedes any ADMM-induced change: the first primal already fails while
+q=0 and center shift=0. Those quantities remain zero because failed outputs are
+discarded and reference load inputs are retained. The far-infeasible moving-load
+warm trajectory, nonlinear rotated tether geometry and SQP linearizations are
+the relevant convergence issue exposed here. The reported native NLP residuals
+show large stationarity/inequality/complementarity residuals while equality
+residuals are near machine precision; QP status is zero throughout. Native
+residuals are solver-maintained statistics and can refer to its last evaluated
+iterate; direct constraint evaluation of the returned x/u remains authoritative.
+Some benchmark returns satisfy the inequality tolerance but still reach the
+SQP limit. Feasibility alone is not full NLP convergence.
+
+### Comparison and review
+
+The historical benchmark had 287/979/627 status-4 failures for N=3/4/5;
+the corrected diagnostics have none, but instead **every local solve reaches
+the SQP iteration limit**. Old N=3 paper had status-zero predicted tether excess
+up to 0.268 m; the current paper maxima are 0.232/0.276/0.253 m and benchmark
+maxima reach 0.631 m. Neither set establishes local nonlinear feasibility.
+Old rewards were about -7.4 in paper mode and -15.6/-23.2/-21.3 in benchmark
+mode; current rewards are -23.4/-23.1/-22.8 in both modes. Old cases all reached
+0.1 m at least once, whereas current cases never reach 0.5 m. Old safe rate and
+mission safety were zero; current values are 100% from zero-action fallback.
+Old residuals were nonzero; current zeros reflect fallback. Local/full timings
+generally increased despite the shorter horizon because the solver now performs
+ten NLP iterations and records more diagnostics. Graph, dt/H and solver mode
+changed together: these paired missions do **not** isolate their individual
+causal effects or support a controller-performance improvement claim.
+
+Main-agent review inspected the actual delegated source/diffs, verified SQP/RTI
+model/cost/constraint identity and N=3/4/5 dimensions, and directly checked
+complete-pair residuals, per-family violation calculations, padding and fallback
+latching. Saved JSON/NPZ safety frequencies, final pose errors, action counts,
+solver counts and residuals were recomputed. The paired plant comparison against
+`aa51397` was inspected: reset and all result leaves were bit-for-bit identical
+for N=3/4/5 over zero, nonzero and mixed five-step action sequences. World dt,
+substeps, physics and declared env.dt are unchanged. Python compilation, CLI,
+native video frame counts and visual plot/frame inspection passed. No commit
+or push was made. A working nominal transport baseline remains unvalidated.
+
+### Current reproduction commands and artifacts
+
+From the repository root:
+
+```bash
+source .venv/acados_env.sh
+
+for n in 3 4 5; do
+  for mode in paper benchmark; do
+    python test_dnmpc.py -n "$n" --epi 1 --seed 1234 --offset 0 --obs 3 \
+      --max-step 128 --dnmpc-constraints "$mode" --acados-nlp-solver sqp \
+      --admm-iterations 5 --wind-accel 0 --log --dpi 80 --no-video \
+      --output "logs/dnmpc_sqp_diagnostic/n${n}_${mode}"
+  done
+done
+```
+
+The actual commands and wall times are saved in
+`logs/dnmpc_sqp_diagnostic/commands.json`: N=3 runs enabled native video, while
+N=4/5 used `--no-video`. To reproduce the saved diagnostic video, omit
+`--no-video` from the N=3 benchmark command. The six runs took about 120 s total,
+including startup, compilation and artifacts; per-update timing is above.
+When the saved artifacts are present:
+
+```bash
+python logs/dnmpc_sqp_diagnostic/summarize.py
+python logs/dnmpc_sqp_diagnostic/plant_equivalence_check.py
+```
+
+`aggregate_diagnosis.json` contains all case statistics, first failures,
+per-robot failing steps and maxima locations. `constraint_failure_index.csv`
+contains every above-tolerance violation. Each case has statistics, CSV summary,
+metadata, complete local diagnostics, failure records and trajectory NPZ. Plots
+reuse Matplotlib: XY paths, x/y/yaw tracking, first-step residuals, residuals versus
+physical time, original signed costs versus physical time and maximum local
+predicted violations versus physical time. Original signed costs are not
+reinterpreted as metre margins.
+
+The saved diagnostic standstill example is
+`logs/dnmpc_sqp_diagnostic/n3_benchmark/videos/episode_0000.mp4`, with plots under
+its `plots/` directory. N=3 paper also has a native video. These are safe but
+unsuccessful controller-failure examples. Among these six missions **no safe
+successful mission and no unsafe mission exists**, so no such representative
+example is claimed and no extra missions were run beyond the stop gate. Native
+playback remains 30 fps: 128 frames represent 12.8 physical seconds but play in
+4.27 s. All experiment artifacts are ignored under `logs/`.
+
+## Initial implementation results before timestep/solver correction
+
+This historical section describes commit `aa51397`, with dt=0.03, H=50,
+one SQP_RTI call per local update and the former N=3 path / N>=4 cycle graph.
+Its reproduction commands require that historical source, not the current
+complete-graph, H=15 implementation. The original artifacts remain under
+`logs/dnmpc_validation/`.
 
 Native ARM64 CPU, seed 1234, episode offset 0, three normal random obstacles,
 wind acceleration zero, H=50, K=5. Each row below is **one 128-step mission**.
@@ -281,7 +519,7 @@ explicit failed-solve zero fallback. Python compilation, CLI and native video
 checks passed. Pre-existing edits to `test.py`, `requirements.txt` and the
 environment factory were preserved byte for byte. No commit or push was made.
 
-## Reproduction and artifacts
+### Historical reproduction and artifacts
 
 From the repository root, with the activation above:
 

@@ -13,13 +13,11 @@ import numpy as np
 from .dnmpc_acados import DNMPCConfig, make_local_solvers, pack_parameters
 
 
-def sparse_neighbors(n):
-    """Path for three robots, cycle for four or more; fixed degree <= 2."""
+def complete_neighbors(n):
+    """Every other active robot is a peer, independent of the observation graph."""
     if n < 3:
         raise ValueError("The transport baseline requires at least three active robots")
-    if n == 3:
-        return tuple(tuple(j for j in (i - 1, i + 1) if 0 <= j < n) for i in range(n))
-    return tuple(((i - 1) % n, (i + 1) % n) for i in range(n))
+    return tuple(tuple(j for j in range(n) if j != i) for i in range(n))
 
 
 def load_reference(pose, goal, horizon, dt, config):
@@ -76,7 +74,8 @@ class DistributedNMPC:
         self.config = config or DNMPCConfig()
         if self.config.admm_iterations < 1:
             raise ValueError("admm_iterations must be positive")
-        self.dt = float(env.dt)
+        self.dt = float(env.physics_dt)
+        self.feasibility_tol = 1e-4  # Retain the existing physical-unit tolerance.
         self.H = round(self.config.horizon_seconds / self.dt)
         if self.H < 1:
             raise ValueError("Prediction horizon must contain at least one interval")
@@ -86,14 +85,12 @@ class DistributedNMPC:
                                           self.cache_dir, self.config)
         self.rho = np.array([self.config.rho_p, self.config.rho_p, self.config.rho_omega])
         self.lower, self.upper = (np.asarray(x) for x in env.action_lim())
-        print(f"DNMPC: dt={self.dt:g}, H={self.H}, T={self.H * self.dt:g}s, "
-              f"K_ADMM={self.config.admm_iterations}, constraints={self.mode}")
-        # User explicitly selected env.dt despite this pre-existing discrepancy.
-        from dgppo.env.vmas_lidar.physax.world import World
-        physical_dt = World()._dt
-        if not np.isclose(physical_dt, self.dt):
-            print(f"DNMPC timestep mismatch: prediction={self.dt:g}s, unchanged "
-                  f"plant World.step={physical_dt:g}s (five physical substeps).")
+        print(f"declared env.dt: {env.dt:.2f}s; actual physics/control dt: {env.physics_dt:.2f}s; "
+              f"DNMPC dt: {self.dt:.2f}s; horizon steps H: {self.H}; "
+              f"physical horizon: {self.H * self.dt:.2f}s", flush=True)
+        print(f"DNMPC: complete graph, K_ADMM={self.config.admm_iterations}, "
+              f"constraints={self.mode}, solver={self.config.acados_nlp_solver}, "
+              f"feasibility_tol={self.feasibility_tol:g} (m or m/s²)", flush=True)
         self.reset()
 
     def reset(self):
@@ -109,39 +106,64 @@ class DistributedNMPC:
         for solver in self.solvers:
             solver.reset()
 
-    def _feasible(self, states, controls, vertex_offset, centers, radii,
-                  neighbor_states=None, tolerance=1e-4):
-        """Only cache/reuse a fallback if its predicted hard constraints hold.
+    def _feasibility(self, states, controls, vertex_offset, centers, radii, neighbor_states=None):
+        """Physical-unit inequality violations of the exact frozen local problem.
 
-        This is a numerical feasibility check, not a plant safety certificate.
-        Successful SQP_RTI iterates can still violate nonlinear constraints.
+        Positive maxima are excess acceleration (m/s²) or distance (m), rather
+        than squared constraint residuals. Locations are [stage, component or
+        obstacle/neighbor slot]. A boolean never depends on the solver status.
         """
-        if not (np.isfinite(states).all() and np.isfinite(controls).all()):
-            return False
-        if np.any(controls[:, :2] < self.lower - tolerance) or np.any(controls[:, :2] > self.upper + tolerance):
-            return False
-        if np.any(np.linalg.norm(controls[:, :2], axis=1) > 6.0 + tolerance):
-            return False
+        families = ("acceleration_component", "acceleration_norm", "robot_obstacle",
+                    "tether", "payload_obstacle", "inter_agent")
+        violations = dict.fromkeys(families, 0.0)
+        locations, margins = {}, dict.fromkeys(families, None)
+        finite = bool(np.isfinite(states).all() and np.isfinite(controls).all())
+        if not finite:
+            return {"predicted_feasible": False, "finite": False,
+                    "violations": dict.fromkeys(families, float("inf")),
+                    "violation_locations": locations, "minimum_margins": margins}
+
+        def record(family, margin):
+            margin = np.asarray(margin)
+            if margin.size:
+                flat = int(np.argmin(margin))
+                minimum = float(margin.flat[flat])
+                margins[family] = minimum
+                violations[family] = max(0.0, -minimum)
+                locations[family] = list(np.unravel_index(flat, margin.shape))
+
+        acceleration = controls[:, :2]
+        record("acceleration_component", np.minimum(acceleration - self.lower, self.upper - acceleration))
+        record("acceleration_norm", 6.0 - np.linalg.norm(acceleration, axis=1))
         yaw = states[:, 6]
         rotated = np.column_stack((np.cos(yaw) * vertex_offset[0] - np.sin(yaw) * vertex_offset[1],
                                    np.sin(yaw) * vertex_offset[0] + np.cos(yaw) * vertex_offset[1]))
-        if np.any(np.linalg.norm(states[:, :2] - states[:, 4:6] - rotated, axis=1)
-                  > self.env.agent_vertex_constraint + tolerance):
-            return False
+        record("tether", self.env.agent_vertex_constraint -
+               np.linalg.norm(states[:, :2] - states[:, 4:6] - rotated, axis=1))
         if len(radii):
-            distances = np.linalg.norm(states[:, None, :2] - centers[None], axis=-1)
-            if np.any(distances < self.env.agent_radius + radii[None] - tolerance):
-                return False
+            record("robot_obstacle", np.linalg.norm(states[:, None, :2] - centers[None], axis=-1)
+                   - self.env.agent_radius - radii[None])
             if self.mode == "benchmark":
-                distances = np.linalg.norm(states[:, None, 4:6] - centers[None], axis=-1)
-                if np.any(distances < np.linalg.norm(vertex_offset) + radii[None] - tolerance):
-                    return False
-        if neighbor_states is not None:
-            for neighbor in neighbor_states:
-                if np.any(np.linalg.norm(states[:, :2] - neighbor[:, :2], axis=1)
-                          < 2 * self.env.agent_radius - tolerance):
-                    return False
-        return True
+                record("payload_obstacle", np.linalg.norm(states[:, None, 4:6] - centers[None], axis=-1)
+                       - np.linalg.norm(vertex_offset) - radii[None])
+        if neighbor_states:
+            peers = np.stack(neighbor_states)
+            record("inter_agent", np.linalg.norm(states[:, None, :2] - peers[:, :, :2].transpose(1, 0, 2), axis=-1)
+                   - 2 * self.env.agent_radius)
+        return {"predicted_feasible": bool(max(violations.values()) <= self.feasibility_tol),
+                "finite": True, "violations": violations,
+                "violation_locations": locations, "minimum_margins": margins}
+
+    def _feasible(self, states, controls, vertex_offset, centers, radii, neighbor_states=None):
+        return self._feasibility(states, controls, vertex_offset, centers, radii,
+                                 neighbor_states)["predicted_feasible"]
+
+    @staticmethod
+    def _solver_stat(solver, field):
+        try:
+            return np.asarray(solver.get_stats(field)).tolist()
+        except (ValueError, RuntimeError, AttributeError):
+            return None
 
     def act(self, graph):
         started = time.perf_counter()
@@ -151,7 +173,7 @@ class DistributedNMPC:
             raise ValueError("Invalid active-agent count")
         if self.neighbors is None:
             self.n = n
-            self.neighbors = sparse_neighbors(n)
+            self.neighbors = complete_neighbors(n)
             self.edges = [(i, j) for i in range(n) for j in self.neighbors[i] if i < j]
         elif n != self.n:
             raise ValueError("Active count changed during a mission; reset the controller")
@@ -187,6 +209,8 @@ class DistributedNMPC:
         local_inputs = self.controls[:, :, 2:5].copy()
         residuals = [consensus_residual(local_inputs, self.edges)]
         statuses, solve_times, native_times = [], [], []
+        local_solves = []
+        fallback = np.zeros(n, dtype=bool)
         force_zero = np.zeros(n, dtype=bool)
 
         for iteration in range(self.config.admm_iterations):
@@ -206,20 +230,37 @@ class DistributedNMPC:
                 else:
                     consensus_center = frozen_inputs[i]
                 solver = self.solvers[i]
+                neighbor_states = ([frozen_robots[j] for j in neighbors]
+                                   if frozen_robots is not None else None)
+                warm = self._feasibility(self.states[i], self.controls[i], offsets[i], centers, radii, neighbor_states)
+                reintegrated_warm = self._feasibility(
+                    forward_prediction(measured[i], self.controls[i], self.dt), self.controls[i],
+                    offsets[i], centers, radii, neighbor_states)
+                initial = self._feasibility(measured[i:i+1], np.empty((0, 5)), offsets[i], centers, radii,
+                                           [peer[:1] for peer in neighbor_states] if neighbor_states else None)
+                previous = self.feasible_controls[i]
+                cached_feasible = previous is not None and self._feasible(
+                    forward_prediction(measured[i], previous, self.dt), previous,
+                    offsets[i], centers, radii, neighbor_states)
+                zero_controls = np.zeros((self.H, 5))
+                zero_input_candidate = self._feasibility(
+                    forward_prediction(measured[i], zero_controls, self.dt), zero_controls,
+                    offsets[i], centers, radii, neighbor_states)
                 solver.constraints_set(0, "lbx", measured[i])
                 solver.constraints_set(0, "ubx", measured[i])
                 for h in range(self.H + 1):
                     neighbor_positions = neighbor_mask = None
                     if frozen_robots is not None:
-                        neighbor_positions = np.zeros((2, 2))
-                        neighbor_mask = np.zeros(2)
+                        neighbor_positions = np.zeros((self.env.num_agents - 1, 2))
+                        neighbor_mask = np.zeros(self.env.num_agents - 1)
                         for slot, j in enumerate(neighbors):
                             neighbor_positions[slot] = frozen_robots[j, h, :2]
                             neighbor_mask[slot] = 1.0
                     parameters = pack_parameters(
                         reference[h], consensus_center[min(h, self.H - 1)], degree,
                         offsets[i], centers, radii, neighbor_positions, neighbor_mask,
-                        radius if self.mode == "benchmark" else None)
+                        radius if self.mode == "benchmark" else None,
+                        num_neighbors=self.env.num_agents - 1)
                     solver.set(h, "p", parameters)
                     solver.set(h, "x", self.states[i, h])
                     if h < self.H:
@@ -233,16 +274,38 @@ class DistributedNMPC:
                     warnings.warn(f"ACADOS exception: {error}")
                 round_times.append(time.perf_counter() - solve_started)
                 round_native.append(native_time)
-                candidate_states = candidate_controls = None
-                if status == 0:
+                try:
                     candidate_states = np.stack([solver.get(h, "x") for h in range(self.H + 1)])
                     candidate_controls = np.stack([solver.get(h, "u") for h in range(self.H)])
-                    if not (np.isfinite(candidate_states).all() and np.isfinite(candidate_controls).all()):
+                    if status == 0 and not (np.isfinite(candidate_states).all() and np.isfinite(candidate_controls).all()):
                         status = -2
+                except Exception:
+                    candidate_states = np.full((self.H + 1, 7), np.nan)
+                    candidate_controls = np.full((self.H, 5), np.nan)
+                    if status == 0:
+                        status = -2
+                assessment = self._feasibility(candidate_states, candidate_controls, offsets[i], centers, radii, neighbor_states)
+                local_solves.append({
+                    "robot": i, "admm_round": iteration, "status": status,
+                    **assessment, "initial_state_feasibility": initial,
+                    "warm_start_feasibility": warm, "cached_warm_start_feasible": bool(cached_feasible),
+                    "reintegrated_warm_start_feasibility": reintegrated_warm,
+                    "zero_input_candidate_feasibility": zero_input_candidate,
+                    "warm_start_dynamics_max_error": float(np.max(np.abs(self.states[i] -
+                        forward_prediction(measured[i], self.controls[i], self.dt)))),
+                    "neighbors": list(neighbors),
+                    "consensus_center_shift": float(np.linalg.norm(consensus_center - frozen_inputs[i], axis=1).max()),
+                    "dual_max_norm": float(np.linalg.norm(self.q[i], axis=1).max()),
+                    "sqp_iter": self._solver_stat(solver, "sqp_iter"),
+                    "qp_status": self._solver_stat(solver, "qp_stat"),
+                    "qp_iter": self._solver_stat(solver, "qp_iter"),
+                    "nlp_residuals": self._solver_stat(solver, "residuals"),
+                    "dynamics_max_error": float(np.max(np.abs(candidate_states -
+                        forward_prediction(measured[i], candidate_controls, self.dt)))),
+                })
                 round_statuses.append(status)
-                neighbor_states = ([frozen_robots[j] for j in neighbors]
-                                   if frozen_robots is not None else None)
                 if status != 0:
+                    fallback[i] = True
                     self.failed_solves += 1
                     print(f"ACADOS failure: robot={i}, step={self.step_index}, "
                           f"ADMM={iteration}, status={status}", flush=True)
@@ -301,6 +364,9 @@ class DistributedNMPC:
             "native_solve_times": native_times,
             "control_update_time": time.perf_counter() - started,
             "zero_fallback_agents": np.flatnonzero(force_zero).tolist(),
+            "fallback_agents": np.flatnonzero(fallback).tolist(),
+            "local_solves": local_solves,
+            "feasibility_tol": self.feasibility_tol,
             "predicted_feasible": predicted_feasible,
         }
         self.step_index += 1

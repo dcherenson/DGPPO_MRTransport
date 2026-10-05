@@ -23,13 +23,26 @@ import numpy as np
 from dgppo.controllers.dnmpc import DistributedNMPC
 from dgppo.controllers.dnmpc_acados import DNMPCConfig
 from dgppo.env import make_env
-from dgppo.env.vmas_lidar.physax.world import World
 from dgppo.trainer.data import Rollout
 
 
 DEFAULT_ENV = "VMASCollaborativeTransportLidar"
 KEY_POOL_SIZE = 1_000
 SUCCESS_THRESHOLDS = (0.1, 0.2, 0.3, 0.5)
+ORIGINAL_COST_NAMES = (
+    "agent_collision",
+    "robot_obstacle",
+    "payload_obstacle",
+    "tether",
+)
+LOCAL_VIOLATION_FAMILIES = (
+    "acceleration_component",
+    "acceleration_norm",
+    "robot_obstacle",
+    "tether",
+    "payload_obstacle",
+    "inter_agent",
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -60,6 +73,27 @@ def _stack_tree(items: list[Any]) -> Any:
     return jtu.tree_map(lambda *xs: jnp.stack(xs, axis=0), *items)
 
 
+def _wrapped_angle_error(angle: float, reference: float) -> float:
+    """Return the shortest signed angular error in radians."""
+    return float(np.arctan2(np.sin(angle - reference), np.cos(angle - reference)))
+
+
+def _pose_vector(value: Any) -> np.ndarray:
+    """Extract the first six-vector from an object/goal state tensor."""
+    array = np.asarray(value, dtype=np.float64)
+    if array.size < 6:
+        raise ValueError("object/goal state must contain at least six values")
+    return array.reshape(-1, array.shape[-1])[0, :6]
+
+
+def _final_pose_errors(final_payload: Any, final_goal: Any) -> tuple[float, float]:
+    payload = _pose_vector(final_payload)
+    goal = _pose_vector(final_goal)
+    # Payload states store yaw at index 4; goal states use the pose prefix
+    # [x, y, yaw] followed by reference derivatives.
+    return float(np.linalg.norm(payload[:2] - goal[:2])), _wrapped_angle_error(payload[4], goal[2])
+
+
 def _reset_key_for_episode(seed: int, offset: int, episode: int):
     """Match test.py's two nested splits before ``test_rollout`` reset.
 
@@ -75,11 +109,111 @@ def _reset_key_for_episode(seed: int, offset: int, episode: int):
     return base_key, key_x0, reset_key
 
 
+def _local_solve_records(diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten the controller's per-step local solve diagnostics."""
+    records: list[dict[str, Any]] = []
+    for step, diagnostic in enumerate(diagnostics):
+        for record in diagnostic.get("local_solves", []) or []:
+            item = dict(record)
+            item.setdefault("episode_step", int(diagnostic.get("episode_step", step)))
+            item.setdefault("feasibility_tol", float(diagnostic.get("feasibility_tol", 1e-4)))
+            records.append(item)
+    return records
+
+
+def _diagnostic_failure_records(diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep a compact JSON-friendly record for failed or infeasible solves."""
+    failures = []
+    for record in _local_solve_records(diagnostics):
+        status = int(record.get("status", 0))
+        feasible = record.get("predicted_feasible", True)
+        if status == 0 and bool(feasible):
+            continue
+        # Keep every controller-provided field, including violation locations,
+        # margins, and warm-start witnesses needed for postmortem analysis.
+        failures.append(dict(record))
+    return failures
+
+
+def _constraint_metrics(
+    costs: np.ndarray,
+    final_cost: np.ndarray,
+    real_num_agents: int,
+) -> dict[str, Any]:
+    """Summarize the four original environment cost constraints.
+
+    Cost values are the unchanged signed values returned by ``env.get_cost``;
+    a nonnegative value is an unsafe constraint.  The final-state metric is
+    kept separate from the pre-step robot/step frequencies.
+    """
+    values = np.asarray(costs, dtype=np.float64)
+    final_values = np.asarray(final_cost, dtype=np.float64)
+    if values.ndim != 3 or values.shape[-1] < len(ORIGINAL_COST_NAMES):
+        raise ValueError(f"expected costs with shape (steps, agents, {len(ORIGINAL_COST_NAMES)})")
+    active = values[:, :real_num_agents, :len(ORIGINAL_COST_NAMES)]
+    final_active = final_values[:real_num_agents, :len(ORIGINAL_COST_NAMES)]
+    unsafe = active >= 0.0
+    final_unsafe = final_active >= 0.0
+    metrics: dict[str, Any] = {}
+    step_count = int(active.shape[0])
+    for index, name in enumerate(ORIGINAL_COST_NAMES):
+        unsafe_family = unsafe[..., index]
+        final_family = final_unsafe[:, index]
+        physical_any = np.any(unsafe_family, axis=1) if step_count else np.empty(0, dtype=bool)
+        robot_any = np.any(unsafe_family, axis=0) if step_count else np.zeros(real_num_agents, dtype=bool)
+        mission_safe = not (np.any(unsafe_family) or np.any(final_family))
+        family = {
+            "unsafe_active_robot_step_fraction": float(np.mean(unsafe_family)) if unsafe_family.size else 0.0,
+            "physical_step_any_active_fraction": float(np.mean(physical_any)) if physical_any.size else 0.0,
+            "robot_everunsafe_fraction": float(np.mean(robot_any)) if robot_any.size else 0.0,
+            "mission_safe_including_final_state": int(mission_safe),
+            "active_robot_step_failures": int(np.count_nonzero(unsafe_family)),
+            "active_robot_step_count": int(unsafe_family.size),
+            "physical_step_any_active_failures": int(np.count_nonzero(physical_any)),
+            "physical_step_count": int(physical_any.size),
+            "robot_everunsafe_count": int(np.count_nonzero(robot_any)),
+            "active_robot_count": int(robot_any.size),
+            "final_state_unsafe_active_agents": int(np.count_nonzero(final_family)),
+        }
+        metrics[name] = family
+    return metrics
+
+
+def _aggregate_constraint_metrics(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-episode original-cost frequencies with explicit labels."""
+    aggregate: dict[str, Any] = {}
+    for name in ORIGINAL_COST_NAMES:
+        entries = [summary.get("constraint_failure_metrics", {}).get(name, {}) for summary in summaries]
+        if not entries:
+            aggregate[name] = {}
+            continue
+        aggregate[name] = {
+            "unsafe_active_robot_step_fraction": float(np.mean([
+                entry.get("unsafe_active_robot_step_fraction", 0.0) for entry in entries
+            ])),
+            "physical_step_any_active_fraction": float(np.mean([
+                entry.get("physical_step_any_active_fraction", 0.0) for entry in entries
+            ])),
+            "robot_everunsafe_fraction": float(np.mean([
+                entry.get("robot_everunsafe_fraction", 0.0) for entry in entries
+            ])),
+            "mission_safe_including_final_state_frequency": float(np.mean([
+                entry.get("mission_safe_including_final_state", 0) for entry in entries
+            ])),
+            "episodes": int(len(entries)),
+        }
+    return aggregate
+
+
 def _diag_metrics(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
     residuals = []
     local_times = []
+    native_times = []
     control_times = []
     failed = 0
+    fallback_updates = 0
+    zero_fallback_updates = 0
+    local_records = _local_solve_records(diagnostics)
     for diagnostic in diagnostics:
         residual = np.asarray(
             [
@@ -93,27 +227,79 @@ def _diag_metrics(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
         local = np.asarray(diagnostic.get("local_solve_times", []), dtype=np.float64)
         if local.size:
             local_times.append(local.reshape(-1))
+        native = np.asarray(diagnostic.get("native_solve_times", []), dtype=np.float64)
+        if native.size:
+            native_times.append(native.reshape(-1))
         control_time = diagnostic.get("control_update_time")
         if control_time is not None:
             control_times.append(float(control_time))
         failed += int(diagnostic.get("failed_solves", 0))
+        fallback_agents = diagnostic.get("fallback_agents")
+        if fallback_agents is None:
+            fallback_agents = [
+                record.get("robot") for record in diagnostic.get("local_solves", []) or []
+                if int(record.get("status", 0)) != 0
+            ]
+        if fallback_agents:
+            fallback_updates += 1
+        if diagnostic.get("zero_fallback_agents"):
+            zero_fallback_updates += 1
 
     residual_array = np.asarray(residuals, dtype=np.float64)
     local_array = np.concatenate(local_times) if local_times else np.empty(0)
+    native_array = np.concatenate(native_times) if native_times else np.empty(0)
     control_array = np.asarray(control_times, dtype=np.float64)
-    return {
+    local_count = len(local_records)
+    status_failures = sum(int(record.get("status", 0)) != 0 for record in local_records)
+    infeasible = sum(not bool(record.get("predicted_feasible", True)) for record in local_records)
+    family_maxima = {}
+    family_counts = {}
+    family_frequencies = {}
+    for family in LOCAL_VIOLATION_FAMILIES:
+        values = np.asarray([
+            float((record.get("violations") or {}).get(family, 0.0))
+            for record in local_records
+        ], dtype=np.float64)
+        # Missing family entries are zero in modes where the constraint is not
+        # present (for example payload/inter-agent in paper mode).
+        family_maxima[family] = float(np.nanmax(values)) if values.size else 0.0
+        tolerances = np.asarray([
+            float(record.get("feasibility_tol", 1e-4)) for record in local_records
+        ], dtype=np.float64)
+        count = int(np.count_nonzero(values > tolerances)) if values.size else 0
+        family_counts[family] = count
+        family_frequencies[family] = float(count / local_count) if local_count else 0.0
+
+    result = {
         "average_residual": np.nanmean(residual_array, axis=0).tolist()
         if residual_array.size else [float("nan")] * 3,
         "maximum_residual": np.nanmax(residual_array, axis=0).tolist()
         if residual_array.size else [float("nan")] * 3,
         "failed_solves": failed,
+        "status_failures": int(status_failures),
+        "status_failure_fraction": float(status_failures / local_count) if local_count else 0.0,
+        "infeasible_local_solves": int(infeasible),
+        "infeasible_local_solve_fraction": float(infeasible / local_count) if local_count else 0.0,
+        "local_solve_count": int(local_count),
+        "local_violation_maxima": family_maxima,
+        "local_violation_counts": family_counts,
+        "local_violation_frequencies": family_frequencies,
+        "fallback_update_count": int(fallback_updates),
+        "fallback_update_fraction": float(fallback_updates / len(diagnostics)) if diagnostics else 0.0,
+        "zero_fallback_update_count": int(zero_fallback_updates),
+        "zero_fallback_update_fraction": float(zero_fallback_updates / len(diagnostics)) if diagnostics else 0.0,
         "average_local_solve_time": float(np.nanmean(local_array)) if local_array.size else float("nan"),
         "maximum_local_solve_time": float(np.nanmax(local_array)) if local_array.size else float("nan"),
+        "average_native_solve_time": float(np.nanmean(native_array)) if native_array.size else float("nan"),
+        "maximum_native_solve_time": float(np.nanmax(native_array)) if native_array.size else float("nan"),
         "average_control_update_time": float(np.nanmean(control_array)) if control_array.size else float("nan"),
+        "maximum_control_update_time": float(np.nanmax(control_array)) if control_array.size else float("nan"),
         "average_full_control_time": float(np.nanmean(control_array)) if control_array.size else float("nan"),
+        "maximum_full_control_time": float(np.nanmax(control_array)) if control_array.size else float("nan"),
         "local_solve_call_count": int(local_array.size),
         "control_update_count": int(control_array.size),
     }
+    return result
 
 
 def _payload_and_goal(graphs: list[Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -150,6 +336,8 @@ def _episode_summary(
     goal: np.ndarray,
     diagnostics: list[dict[str, Any]],
     reset_key: Any,
+    final_payload: Any,
+    final_goal: Any,
 ) -> dict[str, Any]:
     active = np.arange(env.num_agents) < real_num_agents
     active_unsafe = unsafe[:, active]
@@ -157,6 +345,8 @@ def _episode_summary(
     mission_safe = int(not np.any(active_unsafe) and not np.any(final_unsafe[active]))
     safe_rate = float(1.0 - np.any(active_unsafe, axis=0).mean())
     min_dist = _prestep_goal_distance(payload, goal)
+    final_position_error, final_wrapped_yaw_error = _final_pose_errors(final_payload, final_goal)
+    constraint_metrics = _constraint_metrics(costs, final_cost, real_num_agents)
     summary = {
         "episode": int(episode),
         "real_num_agents": int(real_num_agents),
@@ -169,11 +359,27 @@ def _episode_summary(
         "safe_rate": safe_rate,
         "mission_safe": mission_safe,
         "min_dist_to_goal": min_dist,
+        "final_position_error": final_position_error,
+        "final_wrapped_yaw_error": final_wrapped_yaw_error,
+        "final_wrapped_yaw_error_abs": abs(final_wrapped_yaw_error),
+        "original_cost_names": list(ORIGINAL_COST_NAMES),
+        "constraint_failure_metrics": constraint_metrics,
         "reset_key": _jsonable(np.asarray(reset_key, dtype=np.uint32)),
     }
     for threshold in SUCCESS_THRESHOLDS:
         summary[f"success_{str(threshold).replace('.', 'p')}m"] = int(min_dist <= threshold)
     summary.update(_diag_metrics(diagnostics))
+    for name, family in constraint_metrics.items():
+        summary[f"{name}_unsafe_active_robot_step_fraction"] = family[
+            "unsafe_active_robot_step_fraction"
+        ]
+        summary[f"{name}_physical_step_any_active_fraction"] = family[
+            "physical_step_any_active_fraction"
+        ]
+        summary[f"{name}_robot_everunsafe_fraction"] = family["robot_everunsafe_fraction"]
+        summary[f"{name}_mission_safe_including_final_state"] = family[
+            "mission_safe_including_final_state"
+        ]
     return summary
 
 
@@ -209,10 +415,11 @@ def _plot_episode(
     payload: np.ndarray,
     goal: np.ndarray,
     references: np.ndarray,
+    costs: np.ndarray,
     diagnostics: list[dict[str, Any]],
     obstacle_centers: np.ndarray,
     obstacle_radii: np.ndarray,
-    declared_dt: float,
+    controller_dt: float,
     physical_dt: float,
     dpi: int,
 ) -> None:
@@ -224,7 +431,7 @@ def _plot_episode(
 
     output.mkdir(parents=True, exist_ok=True)
     steps, n_agents, action_dim = actions.shape
-    timesteps = np.arange(steps)
+    timesteps = np.arange(steps) * physical_dt
     agent_pos = robotstates[..., :2]
     agent_vel = robotstates[..., 2:4]
 
@@ -238,7 +445,7 @@ def _plot_episode(
         for dim in range(action_dim):
             ax.plot(timesteps, actions[:, agent, dim], label=f"Action {dim}", linewidth=1.2)
         ax.set_title(f"Agent {agent} Actions")
-        ax.set_xlabel("Time Step")
+        ax.set_xlabel("Physical plant time (s)")
         ax.set_ylabel("Action")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -247,7 +454,7 @@ def _plot_episode(
         ax.plot(timesteps, agent_pos[:, agent, 0], label="Position X", color="blue", linewidth=1.2)
         ax.plot(timesteps, agent_pos[:, agent, 1], label="Position Y", color="red", linewidth=1.2)
         ax.set_title(f"Agent {agent} Positions")
-        ax.set_xlabel("Time Step")
+        ax.set_xlabel("Physical plant time (s)")
         ax.set_ylabel("Position")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -256,7 +463,7 @@ def _plot_episode(
         ax.plot(timesteps, agent_vel[:, agent, 0], label="Velocity X", color="green", linewidth=1.2)
         ax.plot(timesteps, agent_vel[:, agent, 1], label="Velocity Y", color="orange", linewidth=1.2)
         ax.set_title(f"Agent {agent} Velocities")
-        ax.set_xlabel("Time Step")
+        ax.set_xlabel("Physical plant time (s)")
         ax.set_ylabel("Velocity")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -264,8 +471,7 @@ def _plot_episode(
     fig.savefig(output / f"episode_{episode:04d}_comprehensive.png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
-    # Payload axes use the physical plant time while references use the
-    # declared controller dt.  This keeps the existing .1/.03 mismatch visible.
+    # Payload axes and all diagnostic plots use physical plant/controller time.
     realized = np.asarray(payload)
     if realized.ndim == 3:
         realized = realized[:, 0, :]
@@ -278,7 +484,7 @@ def _plot_episode(
     for axis, (state_index, label, color) in zip(axes, labels):
         axis.plot(realized_time, realized[:, state_index], color=color, label="realized", linewidth=1.5)
         for reference_index in np.linspace(0, max(steps - 1, 0), min(5, steps), dtype=int):
-            ref_time = reference_index * physical_dt + np.arange(references.shape[1]) * declared_dt
+            ref_time = reference_index * physical_dt + np.arange(references.shape[1]) * controller_dt
             ref_component = {0: 0, 1: 1, 4: 2}[state_index]
             axis.plot(ref_time, references[reference_index, :, ref_component], "--", alpha=0.45,
                       label="planned reference" if reference_index == 0 else None)
@@ -329,6 +535,77 @@ def _plot_episode(
         fig.tight_layout()
         fig.savefig(output / f"episode_{episode:04d}_first_step_residuals.png", dpi=dpi, bbox_inches="tight")
         plt.close(fig)
+
+    # Per-update residuals are plotted against elapsed physical time.  The
+    # first-step round history above remains available for the ADMM detail.
+    diagnostic_time = np.arange(len(diagnostics)) * physical_dt
+    residual_array = np.asarray([
+        [
+            diagnostic.get("primal_residual", np.nan),
+            diagnostic.get("velocity_residual", np.nan),
+            diagnostic.get("angular_residual", np.nan),
+        ]
+        for diagnostic in diagnostics
+    ], dtype=np.float64)
+    if residual_array.size:
+        fig, axis = plt.subplots(figsize=(8, 4))
+        for index, label in enumerate(("primal", "velocity", "angular")):
+            axis.plot(diagnostic_time, residual_array[:, index], label=label)
+        axis.set_xlabel("Physical plant time (s)")
+        axis.set_ylabel("Consensus residual")
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        fig.tight_layout()
+        fig.savefig(output / f"episode_{episode:04d}_residuals_vs_time.png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+
+    # Preserve the original signed environment costs.  A zero crossing is an
+    # unsafe event; this plot deliberately does not reinterpret them as metres.
+    cost_array = np.asarray(costs, dtype=np.float64)
+    if cost_array.ndim == 3 and cost_array.shape[-1] >= len(ORIGINAL_COST_NAMES):
+        max_signed_cost = np.max(cost_array[..., :len(ORIGINAL_COST_NAMES)], axis=1)
+        fig, axis = plt.subplots(figsize=(9, 4.5))
+        for index, name in enumerate(ORIGINAL_COST_NAMES):
+            axis.plot(diagnostic_time[:max_signed_cost.shape[0]], max_signed_cost[:, index], label=name)
+        axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+        axis.set_xlabel("Physical plant time (s)")
+        axis.set_ylabel("Maximum signed original cost")
+        axis.grid(True, alpha=0.3)
+        axis.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(output / f"episode_{episode:04d}_original_costs_vs_time.png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+
+    # Local OCP feasibility is reported in physical units by the controller.
+    # Missing families remain NaN so absent benchmark constraints are visible.
+    if diagnostics:
+        local_violation_array = np.full(
+            (len(diagnostics), len(LOCAL_VIOLATION_FAMILIES)), np.nan, dtype=np.float64
+        )
+        for step, diagnostic in enumerate(diagnostics):
+            records = diagnostic.get("local_solves", []) or []
+            for family_index, family in enumerate(LOCAL_VIOLATION_FAMILIES):
+                values = [
+                    float((record.get("violations") or {}).get(family, np.nan))
+                    for record in records
+                    if family in (record.get("violations") or {})
+                ]
+                if values:
+                    local_violation_array[step, family_index] = np.nanmax(values)
+        if np.isfinite(local_violation_array).any():
+            fig, axis = plt.subplots(figsize=(10, 5))
+            for index, family in enumerate(LOCAL_VIOLATION_FAMILIES):
+                if np.isfinite(local_violation_array[:, index]).any():
+                    axis.plot(diagnostic_time, local_violation_array[:, index], label=family)
+            axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+            axis.set_xlabel("Physical plant time (s)")
+            axis.set_ylabel("Maximum predicted violation (physical units)")
+            axis.grid(True, alpha=0.3)
+            axis.legend(fontsize=8)
+            fig.tight_layout()
+            fig.savefig(output / f"episode_{episode:04d}_local_violations_vs_time.png",
+                        dpi=dpi, bbox_inches="tight")
+            plt.close(fig)
 
 
 def _write_summary_csv(output: Path, summaries: list[dict[str, Any]]) -> None:
@@ -384,7 +661,10 @@ def evaluate(args: argparse.Namespace) -> Path:
         wind_wavelength=args.wind_wavelength,
     )
     loop_steps = args.max_step if args.max_step is not None else env.max_episode_steps
-    physical_world_dt = float(World()._dt)
+    # ``env.dt`` remains the declared task/control-loop value (.03 s).  The
+    # unchanged plant exposes its actual advance as ``physics_dt`` (.1 s),
+    # which is also the controller prediction step for this evaluation.
+    physical_world_dt = float(env.physics_dt)
     env_max_step = int(getattr(env, "max_step", env.max_episode_steps))
     print(
         f"horizon: loop_steps={loop_steps}, env.max_step={env_max_step}, "
@@ -404,12 +684,16 @@ def evaluate(args: argparse.Namespace) -> Path:
     _block_until_ready(warm_step)
     _block_until_ready(warm_cost)
 
-    dnmpc_config = DNMPCConfig(admm_iterations=args.admm_iterations)
+    dnmpc_config = DNMPCConfig(
+        admm_iterations=args.admm_iterations,
+        acados_nlp_solver=args.acados_nlp_solver,
+    )
     controller = DistributedNMPC(
         env,
         constraints=args.dnmpc_constraints,
         config=dnmpc_config,
     )
+    controller_dt = float(controller.dt)
     # Build once, then reset mutable warm-start state at each mission boundary.
     controller.reset()
 
@@ -512,6 +796,8 @@ def evaluate(args: argparse.Namespace) -> Path:
             goal,
             diagnostics,
             reset_key,
+            np.asarray(final_graph.env_states.object),
+            np.asarray(final_graph.env_states.goal),
         )
         summaries.append(summary)
         all_diagnostics.append(diagnostics)
@@ -541,6 +827,9 @@ def evaluate(args: argparse.Namespace) -> Path:
         (output / f"episode_{episode:04d}_diagnostics.json").write_text(
             json.dumps(_jsonable(diagnostics), indent=2, sort_keys=True)
         )
+        (output / f"episode_{episode:04d}_diagnostic_failures.json").write_text(
+            json.dumps(_jsonable(_diagnostic_failure_records(diagnostics)), indent=2, sort_keys=True)
+        )
 
         if args.log:
             log_dir = output / "logs"
@@ -553,10 +842,11 @@ def evaluate(args: argparse.Namespace) -> Path:
                 payload,
                 goal,
                 reference_stack,
+                costs_np,
                 diagnostics,
                 np.asarray(final_graph.env_states.obstacle.center),
                 np.asarray(final_graph.env_states.obstacle.radius),
-                float(env.dt),
+                controller_dt,
                 physical_world_dt,
                 args.dpi,
             )
@@ -591,6 +881,7 @@ def evaluate(args: argparse.Namespace) -> Path:
     statistics = {
         "episode_count": len(summaries),
         "reward_mean": float(np.mean([s["reward"] for s in summaries])),
+        "reward_std": float(np.std([s["reward"] for s in summaries])),
         "cost_mean": float(np.mean([s["cost"] for s in summaries])),
         "safe_rate_mean": float(np.mean([s["safe_rate"] for s in summaries])),
         "mission_safety_rate": float(np.mean([s["mission_safe"] for s in summaries])),
@@ -601,6 +892,18 @@ def evaluate(args: argparse.Namespace) -> Path:
         },
         **aggregate_diagnostics,
         "sum_failed_solves": aggregate_diagnostics["failed_solves"],
+        "constraint_failure_metrics": _aggregate_constraint_metrics(summaries),
+        "final_position_error_mean": float(np.mean([s["final_position_error"] for s in summaries])),
+        "final_position_error_max": float(np.max([s["final_position_error"] for s in summaries])),
+        "final_wrapped_yaw_error_mean": float(np.mean([
+            s["final_wrapped_yaw_error"] for s in summaries
+        ])),
+        "final_wrapped_yaw_error_abs_mean": float(np.mean([
+            s["final_wrapped_yaw_error_abs"] for s in summaries
+        ])),
+        "final_wrapped_yaw_error_abs_max": float(np.max([
+            s["final_wrapped_yaw_error_abs"] for s in summaries
+        ])),
         "episodes": summaries,
     }
     (output / "statistics.json").write_text(json.dumps(_jsonable(statistics), indent=2, sort_keys=True))
@@ -622,12 +925,21 @@ def evaluate(args: argparse.Namespace) -> Path:
         "env_max_step": env_max_step,
         "max_step_note": "target constructor leaves base _max_step at 256 when --max-step is omitted or overridden",
         "dnmpc_constraints": args.dnmpc_constraints,
+        "communication_graph": "complete",
+        "original_cost_names": list(ORIGINAL_COST_NAMES),
+        "local_violation_families": list(LOCAL_VIOLATION_FAMILIES),
+        "acados_nlp_solver": args.acados_nlp_solver,
+        "nlp_solver_max_iter": 10 if args.acados_nlp_solver == "sqp" else None,
+        "feasibility_tol": controller.feasibility_tol,
         "dnmpc_config": asdict(dnmpc_config),
         "declared_env_dt": float(env.dt),
+        "physics_dt": physical_world_dt,
+        "controller_dt": controller_dt,
         "controller_horizon_steps": int(controller.H),
+        "controller_horizon_seconds": float(controller.H * controller_dt),
         "physical_world_dt": physical_world_dt,
         "solver_dimensions": {"nx": 7, "nu": 5},
-        "sparsegraph": {
+        "neighbors": {
             str(i): list(neighbors)
             for i, neighbors in enumerate(controller.neighbors or ())
         },
@@ -665,6 +977,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obs", type=int, default=None)
     parser.add_argument("--max-step", type=int, default=None)
     parser.add_argument("--dnmpc-constraints", choices=("paper", "benchmark"), default="paper")
+    parser.add_argument("--acados-nlp-solver", choices=("sqp_rti", "sqp"), default="sqp_rti")
     parser.add_argument("--admm-iterations", type=int, default=5)
     parser.add_argument("--wind-accel", type=float, default=0.0)
     parser.add_argument("--wind-wavelength", type=float, default=0.75)

@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-NX, NU, MAX_NEIGHBORS, BASE_PARAMETER_SIZE = 7, 5, 2, 12
+NX, NU, BASE_PARAMETER_SIZE = 7, 5, 12
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,23 @@ class DNMPCConfig:
     w_vertex: float = 0.01
     rho_p: float = 20.0
     rho_omega: float = 10.0
+    acados_nlp_solver: str = "sqp_rti"
+
+
+def _acados_nlp_solver_type(config: DNMPCConfig) -> str:
+    solver = str(config.acados_nlp_solver).strip().lower().replace("-", "_")
+    if solver == "sqp_rti":
+        return "SQP_RTI"
+    if solver == "sqp":
+        return "SQP"
+    raise ValueError("acados_nlp_solver must be 'sqp_rti' or 'sqp'")
+
+
+def _neighbor_capacity(value: Any) -> int:
+    value = np.asarray(value, dtype=float).reshape(-1)
+    if value.size != 1 or not np.isfinite(value[0]) or value[0] < 0 or value[0] != np.floor(value[0]):
+        raise ValueError("num_neighbors must be a nonnegative integer")
+    return int(value[0])
 
 
 def _vec(a: Any, n: int, name: str) -> np.ndarray:
@@ -46,19 +63,20 @@ def _obs(centers: Any, radii: Any) -> tuple[np.ndarray, np.ndarray]:
     return c, r
 
 
-def _neighbors(positions: Any, mask: Any) -> tuple[np.ndarray, np.ndarray]:
-    p, m = np.zeros((MAX_NEIGHBORS, 2)), np.zeros(MAX_NEIGHBORS)
+def _neighbors(positions: Any, mask: Any, num_neighbors: int) -> tuple[np.ndarray, np.ndarray]:
+    num_neighbors = _neighbor_capacity(num_neighbors)
+    p, m = np.zeros((num_neighbors, 2)), np.zeros(num_neighbors)
     if positions is not None:
         q = np.asarray(positions, dtype=float)
         q = np.empty((0, 2)) if q.size == 0 else q.reshape(-1, 2)
-        if q.shape[0] > MAX_NEIGHBORS:
-            raise ValueError("at most two benchmark neighbors are supported")
+        if q.shape[0] > num_neighbors:
+            raise ValueError(f"at most {num_neighbors} benchmark neighbors are supported")
         p[: q.shape[0]] = q
         m[: q.shape[0]] = 1.0
     if mask is not None:
         q = np.asarray(mask, dtype=float).reshape(-1)
-        if q.size > MAX_NEIGHBORS:
-            raise ValueError("at most two benchmark neighbor masks are supported")
+        if q.size > num_neighbors:
+            raise ValueError(f"at most {num_neighbors} benchmark neighbor masks are supported")
         m[:] = 0.0
         m[: q.size] = q
     if not np.isfinite(p).all() or not np.isfinite(m).all() or ((m < 0) | (m > 1)).any():
@@ -66,34 +84,39 @@ def _neighbors(positions: Any, mask: Any) -> tuple[np.ndarray, np.ndarray]:
     return p, m
 
 
-def parameter_size(num_obstacles: int, mode: str = "paper") -> int:
+def parameter_size(num_obstacles: int, mode: str = "paper", num_neighbors: int = 0) -> int:
     mode = str(mode).lower()
     if int(num_obstacles) < 0 or mode not in ("paper", "benchmark"):
         raise ValueError("invalid obstacle count or mode")
-    return BASE_PARAMETER_SIZE + 3 * int(num_obstacles) + (7 if mode == "benchmark" else 0)
+    num_neighbors = _neighbor_capacity(num_neighbors)
+    return BASE_PARAMETER_SIZE + 3 * int(num_obstacles) + (3 * num_neighbors + 1 if mode == "benchmark" else 0)
 
 
 def pack_parameters(
     reference: Any, consensus_center: Any, degree: Any, vertex_offset: Any,
     obstacle_centers: Any, obstacle_radii: Any, neighbor_positions: Any = None,
-    neighbor_mask: Any = None, object_radius: Any = None,
+    neighbor_mask: Any = None, object_radius: Any = None, num_neighbors: int = 0,
 ) -> np.ndarray:
     """Pack fixed stage parameters: ref6, centre3, degree, offset2, M circles.
 
-    Optional benchmark fields are always two neighbour positions, two masks, and
-    one payload radius.  Paper mode supplies no robot-message fields; a missing
+    Optional benchmark fields are fixed-size neighbour positions, masks, and one
+    payload radius.  Paper mode supplies no robot-message fields; a missing
     benchmark radius uses ``||vertex_offset||``.
     """
     ref, centre, off = (_vec(reference, 6, "reference"), _vec(consensus_center, 3, "consensus_center"),
                         _vec(vertex_offset, 2, "vertex_offset"))
+    num_neighbors = _neighbor_capacity(num_neighbors)
     d = np.asarray(degree, dtype=float).reshape(-1)
-    if d.size != 1 or not np.isfinite(d[0]) or float(d[0]) not in (1.0, 2.0):
-        raise ValueError("degree must be 1 or 2")
+    benchmark = neighbor_positions is not None or neighbor_mask is not None or object_radius is not None
+    if (d.size != 1 or not np.isfinite(d[0]) or d[0] < 1 or d[0] != np.floor(d[0])
+            or (benchmark and d[0] > num_neighbors)):
+        bound = f" in [1, {num_neighbors}]" if benchmark else " >= 1"
+        raise ValueError(f"degree must be an integer{bound}")
+    d = np.array([int(d[0])], dtype=float)
     c, r = _obs(obstacle_centers, obstacle_radii)
     out = [ref, centre, d, off, c.reshape(-1), r]
-    benchmark = neighbor_positions is not None or neighbor_mask is not None or object_radius is not None
     if benchmark:
-        p, m = _neighbors(neighbor_positions, neighbor_mask)
+        p, m = _neighbors(neighbor_positions, neighbor_mask, num_neighbors)
         radius = float(np.linalg.norm(off)) if object_radius is None else float(_vec(object_radius, 1, "object_radius")[0])
         if radius < 0:
             raise ValueError("object_radius must be nonnegative")
@@ -116,12 +139,14 @@ def _env_constants(env: Any) -> tuple[float, float, np.ndarray, np.ndarray, int]
     return agent_radius, d_tol, lo[:2], hi[:2], m
 
 
-def _make_ocp(env: Any, H: int, dt: float, mode: str, config: DNMPCConfig, cache: Path, name: str):
+def _make_ocp(env: Any, H: int, dt: float, mode: str, config: DNMPCConfig, cache: Path, name: str,
+              num_neighbors: int):
     import casadi as ca
     from acados_template import AcadosModel, AcadosOcp
 
     ar, d_tol, lo, hi, m = _env_constants(env)
-    np_ = parameter_size(m, mode)
+    num_neighbors = _neighbor_capacity(num_neighbors)
+    np_ = parameter_size(m, mode, num_neighbors)
     model = AcadosModel()
     model.name = name
     x, xd, u, p = ca.SX.sym("x", NX), ca.SX.sym("xdot", NX), ca.SX.sym("u", NU), ca.SX.sym("p", np_)
@@ -155,12 +180,13 @@ def _make_ocp(env: Any, H: int, dt: float, mode: str, config: DNMPCConfig, cache
     tx, ty = x[0] - x[4] - roff[0], x[1] - x[5] - roff[1]
     hs.append(tx * tx + ty * ty)
     if mode == "benchmark":
-        b, objr = BASE_PARAMETER_SIZE + 3 * m, BASE_PARAMETER_SIZE + 3 * m + 6
+        b = BASE_PARAMETER_SIZE + 3 * m
+        objr = b + 3 * num_neighbors
         for i in range(m):
             ci, ri = BASE_PARAMETER_SIZE + 2 * i, BASE_PARAMETER_SIZE + 2 * m + i
             hs.append((x[4] - p[ci]) ** 2 + (x[5] - p[ci + 1]) ** 2 - (p[objr] + p[ri]) ** 2)
-        for i in range(MAX_NEIGHBORS):
-            ni, mi = b + 2 * i, b + 4 + i
+        for i in range(num_neighbors):
+            ni, mi = b + 2 * i, b + 2 * num_neighbors + i
             hs.append((x[0] - p[ni]) ** 2 + (x[1] - p[ni + 1]) ** 2 + (1 - p[mi]) * 1e6 - (2 * ar) ** 2)
     hs = ca.vertcat(*hs)
     nh = hs.shape[0]
@@ -173,7 +199,10 @@ def _make_ocp(env: Any, H: int, dt: float, mode: str, config: DNMPCConfig, cache
     ocp.model = model
     ocp.solver_options.N_horizon, ocp.solver_options.tf = H, H * dt
     ocp.solver_options.integrator_type = "ERK"
-    ocp.solver_options.nlp_solver_type = "SQP_RTI"
+    nlp_solver_type = _acados_nlp_solver_type(config)
+    ocp.solver_options.nlp_solver_type = nlp_solver_type
+    if nlp_solver_type == "SQP":
+        ocp.solver_options.nlp_solver_max_iter = 10
     ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.cost_discretization = "EULER"
@@ -210,15 +239,20 @@ def make_local_solvers(env: Any, H: int, dt: float, mode: str, num_agents: int, 
     if mode not in ("paper", "benchmark"):
         raise ValueError("mode must be paper or benchmark")
     ar, d_tol, lo, hi, m = _env_constants(env)
+    num_neighbors = num_agents - 1
+    nlp_solver_type = _acados_nlp_solver_type(config)
     root = Path(tempfile.gettempdir()) / "dgppo_dnmpc_acados" if cache_dir is None else Path(cache_dir).expanduser()
     root.mkdir(parents=True, exist_ok=True)
-    key = json.dumps({"schema": 1, "H": H, "dt": float(dt), "mode": mode, "n": num_agents, "m": m,
+    key = json.dumps({"schema": 2, "H": H, "dt": float(dt), "mode": mode, "n": num_agents,
+                      "num_neighbors": num_neighbors, "m": m,
+                      "acados_nlp_solver": nlp_solver_type,
+                      "nlp_solver_max_iter": 10 if nlp_solver_type == "SQP" else None,
                       "action_lower": lo.tolist(), "action_upper": hi.tolist(),
                       "agent_radius": ar, "d_tol": d_tol, "config": asdict(config)}, sort_keys=True)
     digest = hashlib.sha1(key.encode()).hexdigest()[:16]
     cache, name = root / f"dnmpc_{digest}", f"dnmpc_{digest}"
     cache.mkdir(parents=True, exist_ok=True)
-    ocp = _make_ocp(env, H, float(dt), mode, config, cache, name)
+    ocp = _make_ocp(env, H, float(dt), mode, config, cache, name, num_neighbors)
     ocp.make_consistent(verbose=False)
     library = cache / f"{get_shared_lib_prefix()}acados_ocp_solver_{ocp.name}{get_shared_lib_ext()}"
     ready = Path(ocp.code_gen_options.json_file).exists() and library.exists()
@@ -226,10 +260,12 @@ def make_local_solvers(env: Any, H: int, dt: float, mode: str, num_agents: int, 
     for i in range(num_agents):
         solver = AcadosOcpSolver(ocp, generate=(i == 0 and not ready), build=(i == 0 and not ready),
                                  verbose=False, check_reuse_possible=True)
-        solver.dnmpc_mode, solver.dnmpc_parameter_size, solver.dnmpc_num_obstacles = mode, parameter_size(m, mode), m
+        solver.dnmpc_mode, solver.dnmpc_parameter_size, solver.dnmpc_num_obstacles = mode, parameter_size(m, mode, num_neighbors), m
+        solver.dnmpc_num_neighbors = num_neighbors
+        solver.dnmpc_neighbor_capacity = num_neighbors
         solver.dnmpc_config = config
         result.append(solver)
     return result
 
 
-__all__ = ["DNMPCConfig", "BASE_PARAMETER_SIZE", "MAX_NEIGHBORS", "make_local_solvers", "pack_parameters", "parameter_size"]
+__all__ = ["DNMPCConfig", "BASE_PARAMETER_SIZE", "make_local_solvers", "pack_parameters", "parameter_size"]
