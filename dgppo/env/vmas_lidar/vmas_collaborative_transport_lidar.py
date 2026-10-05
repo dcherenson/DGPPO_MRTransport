@@ -39,6 +39,8 @@ class VMASCollaborativeTransportLidarState(NamedTuple):
     initial_angle_diff: float  # Store initial angle difference for normalization
     step_count: int
     prev_action: Action  # Previous action for smoothness penalty
+    wind_theta: float
+    wind_phase: float
     @property
     def a_pos(self):
         return self.agent[:, :2]
@@ -117,7 +119,9 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
             reward_action_diff: float = 0.1,
             agent_vertex_constraint: float = 0.30,
             min_stiffness: float = 0.05,
-            max_stiffness: float = 0.35
+            max_stiffness: float = 0.35,
+            wind_accel: float = 0.0,
+            wind_wavelength: float = 0.75
     ):
         area_size_value = area_size if area_size is not None else self.PARAMS['default_area_size']
         super().__init__(num_agents, area_size=area_size_value, dt=dt)
@@ -147,6 +151,12 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
         self.agent_vertex_constraint = agent_vertex_constraint
         self.min_stiffness=min_stiffness
         self.max_stiffness=max_stiffness
+        if not np.isfinite(wind_accel) or wind_accel < 0.0:
+            raise ValueError("wind_accel must be finite and nonnegative")
+        if not np.isfinite(wind_wavelength) or wind_wavelength <= 0.0:
+            raise ValueError("wind_wavelength must be finite and positive")
+        self.wind_accel = wind_accel
+        self.wind_wavelength = wind_wavelength
 
         self.agent_radius = self._params["car_radius"]
         
@@ -207,6 +217,10 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
     def reset(self, key: Array) -> GraphsTuple:
         """Reset the environment."""
         random_n_agents,object_key, goal_key, obstacle_key, obstacle_theta_key = jax.random.split(key, 5)
+        # Separate wind randomness preserves all original mission draws.
+        wind_theta_key, wind_phase_key = jax.random.split(jax.random.fold_in(key, 0x57494E44))
+        wind_theta = jax.random.uniform(wind_theta_key, minval=0.0, maxval=2 * jnp.pi)
+        wind_phase = jax.random.uniform(wind_phase_key, minval=0.0, maxval=2 * jnp.pi)
         n_rng_obs = self.n_obs
         real_num_agents = jax.random.randint(random_n_agents, shape=(), minval=self.min_num_agents, maxval=self.max_num_agents+1)
         # real_num_agents = jax.random.randint(random_n_agents, shape=(), minval=3, maxval=6)
@@ -291,7 +305,9 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
             initial_dist2goal=initial_dist2goal,
             initial_angle_diff=initial_angle_diff,
             step_count=0,
-            prev_action=prev_action
+            prev_action=prev_action,
+            wind_theta=wind_theta,
+            wind_phase=wind_phase,
         )
         
         lidar_data = self.get_lidar_data(init_state.agent, init_state.obstacle)
@@ -541,6 +557,14 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
         assert action.shape == (self.num_agents, 2)
         mask = jnp.arange(self.num_agents) < env_state.real_num_agents  # shape: (self.num_agents,)
         action = action * mask[:, None]
+        # Wind affects physical force only; action remains the policy command.
+        e_theta = jnp.array([jnp.cos(env_state.wind_theta), jnp.sin(env_state.wind_theta)])
+        e_perp = jnp.array([-jnp.sin(env_state.wind_theta), jnp.cos(env_state.wind_theta)])
+        shear = jnp.sin((2 * jnp.pi / self.wind_wavelength) * (env_state.a_pos @ e_perp)
+                        + env_state.wind_phase)
+        wind_acc = (self.wind_accel / jnp.sqrt(2.0)) * (e_theta + shear[:, None] * e_perp)
+        wind_acc = jnp.where(mask[:, None], wind_acc, 0.0)
+        physical_acc = action + wind_acc
 
         # Vectorized pre-action correction: compute per-agent acceleration toward object
         # without using host-side scalar conversions so this is trace/JIT-friendly.
@@ -597,7 +621,7 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
                 pos=env_state.a_pos[ii],
                 vel=env_state.a_vel[ii],
             ).withforce(
-                force=action[ii] * 1.0 * self.agent_mass,
+                force=physical_acc[ii] * 1.0 * self.agent_mass,
             )
             for ii in range(self.num_agents)
         ]
@@ -644,6 +668,8 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
             initial_angle_diff=env_state.initial_angle_diff,
             step_count=env_state.step_count + 1,
             prev_action=action,
+            wind_theta=env_state.wind_theta,
+            wind_phase=env_state.wind_phase,
         )
 
         lidar_data_next = self.get_lidar_data(new_state.agent, new_state.obstacle)
@@ -1123,13 +1149,13 @@ class VMASCollaborativeTransportLidar(MultiAgentEnv):
         goal_pos_list = np.array(goals[:, :2])
         object_length = self.polygon_length / (2 * jnp.sin(jnp.pi / T_env_states.real_num_agents[0]))
 
-        # Define node counts according to the ordering in get_graph:
-        # agents, goals, objects, then lidar (obstacle) nodes.
+        # get_graph stores agents and lidar hits, followed by one padding node.
+        # Payload and goal are in env_states, not separate graph nodes.
         n_agent = self.num_agents
-        n_goal = self.num_goals
-        n_object = self.num_objects
+        n_goal = 0
+        n_object = 0
         n_hits = self.top_k_rays * self.num_agents if self._params["n_obs"] > 0 else 0
-        total_nodes = n_agent + n_goal + n_object + n_hits
+        total_nodes = graph0.states.shape[0] - 1
 
         fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=dpi)
         # ax.set_xlim(-1.01 * self.area_size, 1.01 * self.area_size)

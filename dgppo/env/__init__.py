@@ -49,6 +49,8 @@ def make_env(
         agent_vertex_constraint: float = 0.30,
         min_stiffness: float = 0.05,
         max_stiffness: float = 0.15,
+        wind_accel: float = 0.0,
+        wind_wavelength: float = 0.75,
 ) -> MultiAgentEnv:
     assert env_id in ENV.keys(), f'Environment {env_id} not implemented.'
     params = dict(ENV[env_id].PARAMS)
@@ -82,6 +84,8 @@ def make_env(
         agent_vertex_constraint=agent_vertex_constraint,
         min_stiffness=min_stiffness,
         max_stiffness=max_stiffness,
+        wind_accel=wind_accel,
+        wind_wavelength=wind_wavelength,
     )
     # Only the VMAS envs accept the reward/stiffness kwargs above; passing them
     # to the others (LidarTarget, MPETarget, ...) is a TypeError. Keep whatever

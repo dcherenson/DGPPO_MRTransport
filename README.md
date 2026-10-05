@@ -171,6 +171,12 @@ example checkpoint is in `pretrained/VMASCollaborativeTransportLidar_dgppo_seed0
 Runs are logged to Weights & Biases when a connection is available and fall
 back to offline mode otherwise. Set `WANDB_MODE=disabled` to turn it off.
 
+### Run the distributed NMPC baseline
+
+The planar ACADOS baseline uses a separate Python evaluator, `test_dnmpc.py`.
+See [the DNMPC note](DNMPC.md) for setup, the exact formulation, known environment
+discrepancies, reproduction commands and initial validation results.
+
 ## What is new relative to upstream DGPPO
 
 | Path | Role |

@@ -17,7 +17,7 @@ from dgppo.algo import make_algo
 from dgppo.env import make_env
 from dgppo.trainer.utils import test_rollout
 from dgppo.utils.graph import GraphsTuple
-from dgppo.utils.utils import jax_jit_np, jax_vmap
+from dgppo.utils.utils import jax_jit_np, jax_vmap, tree_index
 from dgppo.utils.typing import Array
 
 def test(args):
@@ -45,6 +45,10 @@ def test(args):
         num_obs=config.obs if args.obs is None else args.obs,
         max_step=args.max_step,
         full_observation=args.full_observation,
+        min_num_agents=args.min_num_agents,
+        max_num_agents=args.max_num_agents,
+        wind_accel=args.wind_accel,
+        wind_wavelength=args.wind_wavelength,
     )
 
     # create algorithm
@@ -102,8 +106,7 @@ def test(args):
 
     # set up keys
     test_key = jr.PRNGKey(args.seed)
-    test_keys = jr.split(test_key, 1_000)[: args.epi]
-    test_keys = test_keys[args.offset:]
+    test_keys = jr.split(test_key, 1_000)[args.offset:args.offset + args.epi]
 
     # create rollout function
     rollout_fn = ft.partial(test_rollout,
@@ -124,21 +127,25 @@ def test(args):
     costs = []
     rollouts = []
     is_unsafes = []
+    mission_safes = []
     rates = []
     success_thresholds = [0.1, 0.2, 0.3, 0.5]
     success_hits = {thr: [] for thr in success_thresholds}
     suffix = f"_{args.num_agents}" if args.num_agents is not None else ""
-    seed_suffix = f"_seed{args.seed}"
+    offset_suffix = f"_offset{args.offset}" if args.offset else ""
+    seed_suffix = f"_seed{args.seed}_wind{args.wind_accel:g}_lambda{args.wind_wavelength:g}{offset_suffix}"
     success_log_path = os.path.join(path, f"test_log_successrate{suffix}{seed_suffix}.csv")
-    if args.log and not os.path.exists(success_log_path):
+    if not os.path.exists(success_log_path):
         with open(success_log_path, "w") as f:
             f.write(
                 "real_num_agents,episode,max_steps,area_size,n_obs,reward,cost,safe_rate,"
-                "success_0p1m,success_0p2m,success_0p3m,success_0p5m,min_dist_to_goal\n"
+                "success_0p1m,success_0p2m,success_0p3m,success_0p5m,min_dist_to_goal,"
+                "wind_accel,wind_wavelength,mission_safe\n"
             )
 
     # test
     for i_epi in range(args.epi):
+        episode_index = args.offset + i_epi
         key_x0, _ = jr.split(test_keys[i_epi], 2)
         rollout = rollout_fn(key_x0)
         is_unsafes.append(is_unsafe_fn(rollout.graph))
@@ -174,9 +181,15 @@ def test(args):
             epi_success[thr] = reached
 
         real_num_agents = int(np.array(rollout.graph.env_states.real_num_agents[0]))
+        # Include the final post-step state using the same existing unsafe logic.
+        final_unsafe = is_unsafe_fn(tree_index(rollout.next_graph, slice(-1, None)))[0]
+        active_mask = np.arange(env.num_agents) < real_num_agents
+        mission_safe = int(not np.any((is_unsafes[-1].any(axis=0) | final_unsafe) & active_mask))
+        mission_safes.append(mission_safe)
         print(
-            f"epi: {i_epi}, n_real={real_num_agents}, reward: {epi_reward:.3f}, "
+            f"epi: {episode_index}, n_real={real_num_agents}, reward: {epi_reward:.3f}, "
             f"cost: {epi_cost:.3f}, safe rate: {safe_rate * 100:.3f}%, "
+            f"mission_safe: {mission_safe}, "
             f"success@0.1/0.2/0.3/0.5m: "
             f"{int(epi_success[0.1])}/{int(epi_success[0.2])}/{int(epi_success[0.3])}/{int(epi_success[0.5])}, "
             f"min_dist={min_dist_to_goal:.3f}"
@@ -235,10 +248,10 @@ def test(args):
                 print(f"    obs{i}: cx={cx:.3f}, cy={cy:.3f}{extra}")
         # print(f"epi: {i_epi}, reward: {epi_reward:.3f}, cost: {epi_cost:.3f}, safe rate: {safe_rate * 100:.3f}%")
         with open(success_log_path, "a") as f:
-            f.write(f"{real_num_agents},{i_epi},{env.max_episode_steps},"
+            f.write(f"{real_num_agents},{episode_index},{env.max_episode_steps},"
                     f"{env.area_size},{env.params['n_obs']},{epi_reward:.3f},{epi_cost:.3f},{safe_rate * 100:.3f},"
                     f"{int(epi_success[0.1])},{int(epi_success[0.2])},{int(epi_success[0.3])},{int(epi_success[0.5])},"
-                    f"{min_dist_to_goal:.3f}\n")
+                    f"{min_dist_to_goal:.3f},{args.wind_accel:g},{args.wind_wavelength:g},{mission_safe}\n")
 
         rates.append(np.array(safe_rate))
 
@@ -250,6 +263,7 @@ def test(args):
         f"reward: {np.mean(rewards):.3f}, min/max reward: {np.min(rewards):.3f}/{np.max(rewards):.3f}, "
         f"cost: {np.mean(costs):.3f}, min/max cost: {np.min(costs):.3f}/{np.max(costs):.3f}, "
         f"safe_rate: {safe_mean * 100:.3f}%, "
+        f"mission safety rate: {np.mean(mission_safes) * 100:.3f}%, "
         f"success@0.1m: {success_mean[0.1] * 100:.2f}%, "
         f"success@0.2m: {success_mean[0.2] * 100:.2f}%, "
         f"success@0.3m: {success_mean[0.3] * 100:.2f}%, "
@@ -265,7 +279,7 @@ def test(args):
 
         # Save rollout actions as CSV files
         suffix = f"_{args.num_agents}" if args.num_agents is not None else ""
-        seed_suffix = f"_seed{args.seed}"
+        seed_suffix = f"_seed{args.seed}_wind{args.wind_accel:g}_lambda{args.wind_wavelength:g}{offset_suffix}"
         actions_dir = os.path.join(path, f"actions_successrate{suffix}{seed_suffix}")
         if not os.path.exists(actions_dir):
             os.makedirs(actions_dir)
@@ -490,7 +504,8 @@ def test(args):
     videos_dir.mkdir(exist_ok=True, parents=True)
     for ii, (rollout, Ta_is_unsafe) in enumerate(zip(rollouts, is_unsafes)):
         safe_rate = rates[ii] * 100
-        video_name = f"n{num_agents}_epi{ii:02}_reward{rewards[ii]:.3f}_cost{costs[ii]:.3f}_sr{safe_rate:.0f}"
+        video_name = (f"n{num_agents}_seed{args.seed}_epi{args.offset + ii:02}_wind{args.wind_accel:g}"
+                      f"_reward{rewards[ii]:.3f}_cost{costs[ii]:.3f}_sr{safe_rate:.0f}")
         viz_opts = {}
         video_path = videos_dir / f"{stamp_str}_{video_name}.mp4"
         env.render_video(rollout, video_path, Ta_is_unsafe, viz_opts, dpi=args.dpi)
@@ -513,6 +528,10 @@ def main():
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument("--max-step", type=int, default=None)
     parser.add_argument("--log", action="store_true", default=False)
+    parser.add_argument("--wind-accel", type=float, default=0.0)
+    parser.add_argument("--wind-wavelength", type=float, default=0.75)
+    parser.add_argument("--min-num-agents", type=int, default=3)
+    parser.add_argument("--max-num-agents", type=int, default=5)
 
     # default arguments
     parser.add_argument("-n", "--num-agents", type=int, default=None)
