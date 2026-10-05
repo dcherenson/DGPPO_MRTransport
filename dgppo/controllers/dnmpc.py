@@ -193,10 +193,15 @@ class DistributedNMPC:
         measured = np.concatenate((np.asarray(state.agent)[:n, :4],
                                    np.tile(pose, (n, 1))), axis=1)
         if self.controls is None:
+            # Feasible zero-input initialization for the first NMPC solve.
+            # [a_ix, a_iy, v_Lx, v_Ly, omega_L] = 0.
             self.controls = np.zeros((n, self.H, 5))
-            self.controls[:, :, 2:5] = reference[None, :-1, 3:6]
-            self.states = np.stack([forward_prediction(measured[i], self.controls[i], self.dt)
-                                    for i in range(n)])
+
+            self.states = np.stack([
+                forward_prediction(measured[i], self.controls[i], self.dt)
+                for i in range(n)
+            ])
+
             self.q = np.zeros((n, self.H, 3))
             self.feasible_controls = [None] * n
         else:

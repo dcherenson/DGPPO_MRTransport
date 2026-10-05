@@ -193,7 +193,9 @@ def _make_ocp(env: Any, H: int, dt: float, mode: str, config: DNMPCConfig, cache
     uh_state = np.full(nh, 1e8)  # finite JSON representation of +infinity
     uh_state[m] = d_tol**2
     hp = ca.vertcat(hs, u[0] ** 2 + u[1] ** 2)
-    lh, uh = np.r_[np.zeros(nh), 0.0], np.r_[uh_state, 36.0]
+    lh_state = np.zeros(nh)
+    lh_state[m] = -1e8
+    lh, uh = np.r_[lh_state, -1e8], np.r_[uh_state, 36.0]
 
     ocp = AcadosOcp()
     ocp.model = model
@@ -202,7 +204,8 @@ def _make_ocp(env: Any, H: int, dt: float, mode: str, config: DNMPCConfig, cache
     nlp_solver_type = _acados_nlp_solver_type(config)
     ocp.solver_options.nlp_solver_type = nlp_solver_type
     if nlp_solver_type == "SQP":
-        ocp.solver_options.nlp_solver_max_iter = 10
+        ocp.solver_options.nlp_solver_max_iter = 50
+        ocp.solver_options.globalization = "MERIT_BACKTRACKING"
     ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.cost_discretization = "EULER"
@@ -216,7 +219,7 @@ def _make_ocp(env: Any, H: int, dt: float, mode: str, config: DNMPCConfig, cache
     ocp.constraints.lbx_0 = ocp.constraints.ubx_0 = np.zeros(NX)
     ocp.model.con_h_expr, ocp.constraints.lh, ocp.constraints.uh = hp, lh, uh
     ocp.model.con_h_expr_0, ocp.constraints.lh_0, ocp.constraints.uh_0 = hp, lh, uh
-    ocp.model.con_h_expr_e, ocp.constraints.lh_e, ocp.constraints.uh_e = hs, np.zeros(nh), uh_state
+    ocp.model.con_h_expr_e, ocp.constraints.lh_e, ocp.constraints.uh_e = hs, lh_state, uh_state
     ocp.parameter_values = np.zeros(np_)
     ocp.code_gen_options.code_export_directory = str(cache)
     ocp.code_gen_options.json_file = str(cache / "acados_ocp_nlp.json")
@@ -243,10 +246,10 @@ def make_local_solvers(env: Any, H: int, dt: float, mode: str, num_agents: int, 
     nlp_solver_type = _acados_nlp_solver_type(config)
     root = Path(tempfile.gettempdir()) / "dgppo_dnmpc_acados" if cache_dir is None else Path(cache_dir).expanduser()
     root.mkdir(parents=True, exist_ok=True)
-    key = json.dumps({"schema": 2, "H": H, "dt": float(dt), "mode": mode, "n": num_agents,
+    key = json.dumps({"schema": 4, "H": H, "dt": float(dt), "mode": mode, "n": num_agents,
                       "num_neighbors": num_neighbors, "m": m,
                       "acados_nlp_solver": nlp_solver_type,
-                      "nlp_solver_max_iter": 10 if nlp_solver_type == "SQP" else None,
+                      "nlp_solver_max_iter": 50 if nlp_solver_type == "SQP" else None,
                       "action_lower": lo.tolist(), "action_upper": hi.tolist(),
                       "agent_radius": ar, "d_tol": d_tol, "config": asdict(config)}, sort_keys=True)
     digest = hashlib.sha1(key.encode()).hexdigest()[:16]
