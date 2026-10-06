@@ -173,9 +173,9 @@ back to offline mode otherwise. Set `WANDB_MODE=disabled` to turn it off.
 
 ### Run the distributed NMPC baseline
 
-The planar ACADOS baseline uses a separate Python evaluator, `test_dnmpc.py`.
-See [the DNMPC note](DNMPC.md) for setup, the exact formulation, known environment
-discrepancies, reproduction commands and initial validation results.
+The planar ACADOS controller uses a matching nominal kinematic/geometric plant
+and a separate evaluator, `test_dnmpc.py`. See [the DNMPC note](DNMPC.md) for the
+paper mapping, setup, reproduction command and short validation results.
 
 ## What is new relative to upstream DGPPO
 
